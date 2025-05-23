@@ -1,0 +1,32 @@
+[package]
+name = "nvme-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["liberodark"]
+description = "NVMe health monitoring tool with email alerts"
+repository = "https://github.com/liberodark/nvme-rs"
+license = "GPL-3.0"
+keywords = ["nvme", "monitoring", "health", "storage", "disk"]
+categories = ["command-line-utilities", "system-tools"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+libc = "0.2"
+lettre = "0.11"
+chrono = "0.4"
+hostname = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+[lints.rust]
+unsafe_code = "deny"
+unused_imports = "deny"

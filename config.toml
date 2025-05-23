@@ -1,0 +1,28 @@
+# Check interval in seconds (default: 3600 = 1 hour)
+check_interval_secs = 3600
+
+[thresholds]
+# Temperature thresholds in Celsius
+temp_warning = 55
+temp_critical = 65
+
+# Wear level thresholds in percentage
+wear_warning = 20
+wear_critical = 50
+
+# Available spare threshold in percentage
+spare_warning = 50
+
+# Error count threshold
+error_threshold = 5000
+
+# Email configuration (optional)
+# Remove this section to disable email alerts
+[email]
+smtp_server = "smtp.gmail.com"
+smtp_port = 587
+smtp_username = "your-email@gmail.com"
+smtp_password_file = "/run/secrets/smtp-password"
+from = "NVMe Monitor <nvme-monitor@example.com>"
+to = "admin@example.com"
+use_tls = true
