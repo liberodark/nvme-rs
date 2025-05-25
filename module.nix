@@ -148,6 +148,26 @@ in
           "${configFile}"
         ];
 
+        DynamicUser = true;
+        SupplementaryGroups = [ "disk" ];
+        CapabilityBoundingSet = [ "CAP_SYS_ADMIN" ];
+        AmbientCapabilities = [ "CAP_SYS_ADMIN" ];
+        LimitCORE = 0;
+        LimitNOFILE = 65535;
+        LockPersonality = true;
+        MemorySwapMax = 0;
+        MemoryZSwapMax = 0;
+        PrivateTmp = true;
+        ProcSubset = "pid";
+        ProtectClock = true;
+        ProtectControlGroups = true;
+        ProtectHome = true;
+        ProtectHostname = true;
+        ProtectKernelLogs = true;
+        ProtectKernelModules = true;
+        ProtectKernelTunables = true;
+        ProtectProc = "invisible";
+        ProtectSystem = "strict";
         Restart = "on-failure";
         RestartSec = "10s";
         RestrictAddressFamilies = [
@@ -155,6 +175,16 @@ in
           "AF_INET6"
           "AF_UNIX"
         ];
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        SystemCallArchitectures = "native";
+        SystemCallFilter = [
+          "@system-service"
+          "@resources"
+          "~@privileged"
+        ];
+        NoNewPrivileges = true;
+        UMask = "0077";
       };
     };
 
