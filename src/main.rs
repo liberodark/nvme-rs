@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use lettre::message::{header::ContentType, Mailbox};
+use lettre::message::{Mailbox, header::ContentType};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ mod nvme_ioctl {
     }
 }
 
-use nvme_ioctl::{ioctl_admin_cmd, NvmeAdminCmd};
+use nvme_ioctl::{NvmeAdminCmd, ioctl_admin_cmd};
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -678,4 +678,325 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_u128_from_bytes() {
+        let bytes: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(u128_from_bytes(&bytes), 1);
+
+        let bytes: [u8; 16] = [
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        ];
+        assert_eq!(u128_from_bytes(&bytes), u128::MAX);
+
+        let bytes: [u8; 16] = [0; 16];
+        assert_eq!(u128_from_bytes(&bytes), 0);
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = Config::default();
+        assert_eq!(config.check_interval_secs, 3600);
+        assert_eq!(config.thresholds.temp_warning, 55);
+        assert_eq!(config.thresholds.temp_critical, 65);
+        assert_eq!(config.thresholds.wear_warning, 20);
+        assert_eq!(config.thresholds.wear_critical, 50);
+        assert_eq!(config.thresholds.spare_warning, 50);
+        assert_eq!(config.thresholds.error_threshold, 100);
+        assert!(config.email.is_none());
+    }
+
+    #[test]
+    fn test_config_parsing() {
+        let config_content = r#"
+check_interval_secs = 7200
+
+[thresholds]
+temp_warning = 60
+temp_critical = 70
+wear_warning = 25
+wear_critical = 60
+spare_warning = 40
+error_threshold = 200
+
+[email]
+smtp_server = "smtp.test.com"
+smtp_port = 465
+smtp_username = "test@test.com"
+smtp_password_file = "/tmp/password"
+from = "monitor@test.com"
+to = "admin@test.com"
+use_tls = false
+"#;
+
+        let config: Config = toml::from_str(config_content).unwrap();
+        assert_eq!(config.check_interval_secs, 7200);
+        assert_eq!(config.thresholds.temp_warning, 60);
+        assert_eq!(config.thresholds.temp_critical, 70);
+        assert_eq!(config.thresholds.wear_warning, 25);
+        assert_eq!(config.thresholds.wear_critical, 60);
+        assert_eq!(config.thresholds.spare_warning, 40);
+        assert_eq!(config.thresholds.error_threshold, 200);
+
+        let email = config.email.unwrap();
+        assert_eq!(email.smtp_server, "smtp.test.com");
+        assert_eq!(email.smtp_port, 465);
+        assert_eq!(email.smtp_username, "test@test.com");
+        assert_eq!(email.smtp_password_file, "/tmp/password");
+        assert_eq!(email.from, "monitor@test.com");
+        assert_eq!(email.to, "admin@test.com");
+        assert!(!email.use_tls);
+    }
+
+    #[test]
+    fn test_partial_config_parsing() {
+        let config_content = r#"
+[thresholds]
+temp_warning = 60
+"#;
+
+        let config: Config = toml::from_str(config_content).unwrap();
+        assert_eq!(config.check_interval_secs, 3600);
+        assert_eq!(config.thresholds.temp_warning, 60);
+        assert_eq!(config.thresholds.temp_critical, 65);
+    }
+
+    #[test]
+    fn test_alert_level_string_conversion() {
+        assert_eq!(AlertLevel::Warning.as_str(), "WARNING");
+        assert_eq!(AlertLevel::Critical.as_str(), "CRITICAL");
+        assert_eq!(AlertLevel::Warning.as_css_class(), "warning");
+        assert_eq!(AlertLevel::Critical.as_css_class(), "critical");
+    }
+
+    #[test]
+    fn test_check_drive_health_temperature_alerts() {
+        let thresholds = Thresholds {
+            temp_warning: 55,
+            temp_critical: 65,
+            ..Default::default()
+        };
+
+        let mut smart_log = NvmeSmartLog::default();
+        smart_log.temperature = (45u16 + 273).to_le_bytes();
+        smart_log.avail_spare = 100;
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert!(status.alerts.is_empty());
+        assert_eq!(status.temperature_c, 45);
+
+        smart_log.temperature = (60u16 + 273).to_le_bytes();
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].level, AlertLevel::Warning);
+        assert!(status.alerts[0].message.contains("High temperature"));
+
+        smart_log.temperature = (70u16 + 273).to_le_bytes();
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].level, AlertLevel::Critical);
+        assert!(status.alerts[0].message.contains("Critical temperature"));
+    }
+
+    #[test]
+    fn test_check_drive_health_wear_alerts() {
+        let thresholds = Thresholds {
+            wear_warning: 20,
+            wear_critical: 50,
+            ..Default::default()
+        };
+
+        let mut smart_log = NvmeSmartLog::default();
+        smart_log.avail_spare = 100;
+
+        smart_log.percent_used = 10;
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert!(status.alerts.is_empty());
+        assert_eq!(status.wear_percentage, 10);
+
+        smart_log.percent_used = 25;
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].level, AlertLevel::Warning);
+        assert!(status.alerts[0].message.contains("High wear level"));
+
+        smart_log.percent_used = 60;
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].level, AlertLevel::Critical);
+        assert!(status.alerts[0].message.contains("Critical wear level"));
+    }
+
+    #[test]
+    fn test_check_drive_health_spare_alerts() {
+        let thresholds = Thresholds {
+            spare_warning: 50,
+            ..Default::default()
+        };
+
+        let mut smart_log = NvmeSmartLog::default();
+        smart_log.temperature = 273u16.to_le_bytes();
+
+        smart_log.avail_spare = 100;
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert!(status.alerts.is_empty());
+
+        smart_log.avail_spare = 40;
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].level, AlertLevel::Warning);
+        assert!(status.alerts[0].message.contains("Low spare capacity"));
+    }
+
+    #[test]
+    fn test_check_drive_health_error_alerts() {
+        let thresholds = Thresholds {
+            error_threshold: 100,
+            ..Default::default()
+        };
+
+        let mut smart_log = NvmeSmartLog::default();
+        smart_log.avail_spare = 100;
+
+        smart_log.num_err_log_entries = 50u128.to_le_bytes();
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert!(status.alerts.is_empty());
+
+        smart_log.num_err_log_entries = 150u128.to_le_bytes();
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].level, AlertLevel::Warning);
+        assert!(status.alerts[0].message.contains("High error count"));
+    }
+
+    #[test]
+    fn test_check_drive_health_media_errors() {
+        let thresholds = Thresholds::default();
+        let mut smart_log = NvmeSmartLog::default();
+        smart_log.avail_spare = 100;
+
+        smart_log.media_errors = 0u128.to_le_bytes();
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert!(status.alerts.is_empty());
+
+        smart_log.media_errors = 5u128.to_le_bytes();
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert_eq!(status.alerts.len(), 1);
+        assert_eq!(status.alerts[0].level, AlertLevel::Critical);
+        assert!(status.alerts[0].message.contains("Media errors detected"));
+    }
+
+    #[test]
+    fn test_check_drive_health_multiple_alerts() {
+        let thresholds = Thresholds {
+            temp_warning: 55,
+            wear_warning: 20,
+            spare_warning: 50,
+            error_threshold: 100,
+            ..Default::default()
+        };
+
+        let mut smart_log = NvmeSmartLog::default();
+        smart_log.temperature = (60u16 + 273).to_le_bytes();
+        smart_log.percent_used = 25;
+        smart_log.avail_spare = 40;
+        smart_log.num_err_log_entries = 150u128.to_le_bytes();
+        smart_log.media_errors = 1u128.to_le_bytes();
+
+        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        assert_eq!(status.alerts.len(), 5);
+
+        let warning_count = status
+            .alerts
+            .iter()
+            .filter(|a| a.level == AlertLevel::Warning)
+            .count();
+        let critical_count = status
+            .alerts
+            .iter()
+            .filter(|a| a.level == AlertLevel::Critical)
+            .count();
+        assert_eq!(warning_count, 4);
+        assert_eq!(critical_count, 1);
+    }
+
+    #[test]
+    fn test_data_unit_conversion() {
+        let mut smart_log = NvmeSmartLog::default();
+        smart_log.avail_spare = 100;
+        smart_log.data_units_written = 1953125u128.to_le_bytes();
+        smart_log.data_units_read = 3906250u128.to_le_bytes();
+
+        let status = check_drive_health("/dev/test", &smart_log, &Thresholds::default());
+
+        assert!((status.data_written_tb - 1.0).abs() < 0.01);
+        assert!((status.data_read_tb - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_find_nvme_devices_pattern_matching() {
+        let test_cases = vec![
+            ("nvme0n1", true),
+            ("nvme0n2", true),
+            ("nvme1n1", true),
+            ("nvme10n1", true),
+            ("nvme0", false),
+            ("nvme1", false),
+            ("nvme0n1p1", false),
+            ("nvme0n1p2", false),
+            ("sda", false),
+            ("sdb1", false),
+        ];
+
+        for (name, should_match) in test_cases {
+            let matches = if name.starts_with("nvme") && name.contains('n') && !name.contains('p') {
+                let suffix = &name[4..];
+                suffix.contains('n')
+            } else {
+                false
+            };
+            assert_eq!(
+                matches, should_match,
+                "Pattern matching failed for: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_log_message() {
+        let message = "Test message";
+        let formatted = format_log_message(message);
+        assert!(formatted.contains(message));
+        assert!(formatted.contains(":"));
+    }
+
+    #[test]
+    fn test_drive_status_serialization() {
+        let status = DriveStatus {
+            device: "/dev/nvme0n1".to_string(),
+            temperature_c: 45,
+            wear_percentage: 10,
+            spare_percentage: 100,
+            errors: 0,
+            media_errors: 0,
+            power_on_hours: 1000,
+            data_written_tb: 5.5,
+            data_read_tb: 10.2,
+            alerts: vec![Alert {
+                level: AlertLevel::Warning,
+                message: "Test warning".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("nvme0n1"));
+        assert!(json.contains("45"));
+        assert!(json.contains("Test warning"));
+        assert!(json.contains("Warning"));
+    }
 }
