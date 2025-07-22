@@ -279,7 +279,7 @@ fn get_smart_log(device_path: &str) -> Result<NvmeSmartLog> {
         .read(true)
         .write(true)
         .open(device_path)
-        .with_context(|| format!("Failed to open device {}", device_path))?;
+        .with_context(|| format!("Failed to open device {device_path}"))?;
 
     let mut smart_log = NvmeSmartLog::default();
     let mut cmd = NvmeAdminCmd {
@@ -367,7 +367,7 @@ fn check_drive_health(
     if media_errors > 0 {
         alerts.push(Alert {
             level: AlertLevel::Critical,
-            message: format!("Media errors detected: {}", media_errors),
+            message: format!("Media errors detected: {media_errors}"),
         });
     }
 
@@ -549,7 +549,7 @@ fn check_all_drives(config: &Config) -> Result<Vec<DriveStatus>> {
                 statuses.push(status);
             }
             Err(e) => {
-                eprintln!("Error checking {}: {}", device, e);
+                eprintln!("Error checking {device}: {e}");
             }
         }
     }
@@ -612,7 +612,7 @@ fn run_daemon(config: Config) -> Result<()> {
 
                     if let Some(ref email_config) = config.email {
                         if let Err(e) = send_email_alert(email_config, &statuses) {
-                            eprintln!("Failed to send email alert: {}", e);
+                            eprintln!("Failed to send email alert: {e}");
                         }
                     }
                 } else {
@@ -622,7 +622,7 @@ fn run_daemon(config: Config) -> Result<()> {
             Err(e) => {
                 eprintln!(
                     "{}",
-                    format_log_message(&format!("Error checking drives: {}", e))
+                    format_log_message(&format!("Error checking drives: {e}"))
                 );
             }
         }
@@ -641,9 +641,9 @@ fn main() -> Result<()> {
         } => {
             let config = if let Some(path) = config_path {
                 let config_str = std::fs::read_to_string(&path)
-                    .with_context(|| format!("Failed to read config file: {}", path))?;
+                    .with_context(|| format!("Failed to read config file: {path}"))?;
                 toml::from_str(&config_str)
-                    .with_context(|| format!("Failed to parse config file: {}", path))?
+                    .with_context(|| format!("Failed to parse config file: {path}"))?
             } else {
                 Config::default()
             };
@@ -669,9 +669,9 @@ fn main() -> Result<()> {
             config: config_path,
         } => {
             let config_str = std::fs::read_to_string(&config_path)
-                .with_context(|| format!("Failed to read config file: {}", config_path))?;
+                .with_context(|| format!("Failed to read config file: {config_path}"))?;
             let config: Config = toml::from_str(&config_str)
-                .with_context(|| format!("Failed to parse config file: {}", config_path))?;
+                .with_context(|| format!("Failed to parse config file: {config_path}"))?;
 
             run_daemon(config)?;
         }
