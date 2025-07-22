@@ -36,6 +36,11 @@ jobs:
           rustup component add rustfmt clippy
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check Rust and Clippy versions
+        run: |
+          rustc --version
+          cargo clippy --version
+          cargo --version
       - name: Run clippy
         run: cargo clippy -- -D warnings
 
