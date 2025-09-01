@@ -28,11 +28,11 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libudev-dev cloud-guest-utils xfsprogs btrfs-progs
+          sudo apt-get install -y pkg-config libssl-dev
       - name: Install Rust
         run: |
-          rustup update stable
-          rustup default stable
+          rustup update 1.86.0
+          rustup default 1.86.0
           rustup component add rustfmt clippy
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -65,7 +65,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libudev-dev cloud-guest-utils xfsprogs btrfs-progs
+          sudo apt-get install -y pkg-config libssl-dev
       - name: Install Rust
         run: |
           rustup update ${{ matrix.rust }}
