@@ -114,6 +114,45 @@ impl Default for NvmeSmartLog {
     }
 }
 
+// Simplified NVMe Identify Controller structure
+// We only define the fields we need to avoid defining the entire 4096 byte structure
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct NvmeIdentifyController {
+    vid: u16,         // PCI Vendor ID
+    ssvid: u16,       // PCI Subsystem Vendor ID
+    sn: [u8; 20],     // Serial Number
+    mn: [u8; 40],     // Model Number
+    fr: [u8; 8],      // Firmware Revision
+    rab: u8,          // Recommended Arbitration Burst
+    ieee: [u8; 3],    // IEEE OUI Identifier
+    cmic: u8,         // Controller Multi-Path I/O and Namespace Sharing Capabilities
+    mdts: u8,         // Maximum Data Transfer Size
+    cntlid: u16,      // Controller ID
+    ver: u32,         // Version
+    rtd3r: u32,       // RTD3 Resume Latency
+    rtd3e: u32,       // RTD3 Entry Latency
+    oaes: u32,        // Optional Async Events Supported
+    ctratt: u32,      // Controller Attributes
+    rrls: u16,        // Read Recovery Levels Supported
+    rsvd106: [u8; 9], // Reserved
+    cntrltype: u8,    // Controller Type
+    fguid: [u8; 16],  // FRU Globally Unique Identifier
+    crdt1: u16,       // Command Retry Delay Time 1
+    crdt2: u16,       // Command Retry Delay Time 2
+    crdt3: u16,       // Command Retry Delay Time 3
+    rsvd134: [u8; 122], // Reserved
+                      // We stop here as we only need SN and MN which are at the beginning
+                      // The full structure is 4096 bytes
+}
+
+// Full identify data structure (4096 bytes)
+#[repr(C)]
+struct NvmeIdentifyData {
+    controller: NvmeIdentifyController,
+    _padding: [u8; 3840], // 4096 - 256 = 3840
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
     #[serde(default = "default_check_interval")]
@@ -229,8 +268,15 @@ enum Commands {
 }
 
 #[derive(Debug, Serialize)]
+struct DriveInfo {
+    model: String,
+    serial_number: String,
+}
+
+#[derive(Debug, Serialize)]
 struct DriveStatus {
     device: String,
+    info: DriveInfo,
     temperature_c: u16,
     wear_percentage: u8,
     spare_percentage: u8,
@@ -274,6 +320,62 @@ fn u128_from_bytes(bytes: &[u8; 16]) -> u128 {
     u128::from_le_bytes(*bytes)
 }
 
+fn bytes_to_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim().to_string()
+}
+
+fn get_identify_controller(device_path: &str) -> Result<NvmeIdentifyController> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(device_path)
+        .with_context(|| format!("Failed to open device {device_path}"))?;
+
+    let mut identify_data = NvmeIdentifyData {
+        controller: NvmeIdentifyController {
+            vid: 0,
+            ssvid: 0,
+            sn: [0; 20],
+            mn: [0; 40],
+            fr: [0; 8],
+            rab: 0,
+            ieee: [0; 3],
+            cmic: 0,
+            mdts: 0,
+            cntlid: 0,
+            ver: 0,
+            rtd3r: 0,
+            rtd3e: 0,
+            oaes: 0,
+            ctratt: 0,
+            rrls: 0,
+            rsvd106: [0; 9],
+            cntrltype: 0,
+            fguid: [0; 16],
+            crdt1: 0,
+            crdt2: 0,
+            crdt3: 0,
+            rsvd134: [0; 122],
+        },
+        _padding: [0; 3840],
+    };
+
+    let mut cmd = NvmeAdminCmd {
+        opcode: 0x06, // Identify
+        nsid: 0,
+        addr: &mut identify_data as *mut _ as u64,
+        data_len: 4096,
+        cdw10: 0x01, // CNS = 0x01 for Identify Controller
+        ..Default::default()
+    };
+
+    ioctl_admin_cmd(file.as_raw_fd(), &mut cmd)
+        .map_err(|e| anyhow::anyhow!("Failed to get identify controller: {}", e))?;
+
+    Ok(identify_data.controller)
+}
+
 fn get_smart_log(device_path: &str) -> Result<NvmeSmartLog> {
     let file = OpenOptions::new()
         .read(true)
@@ -300,6 +402,7 @@ fn get_smart_log(device_path: &str) -> Result<NvmeSmartLog> {
 fn check_drive_health(
     device: &str,
     smart_log: &NvmeSmartLog,
+    identify: &NvmeIdentifyController,
     thresholds: &Thresholds,
 ) -> DriveStatus {
     let mut alerts = Vec::new();
@@ -373,6 +476,10 @@ fn check_drive_health(
 
     DriveStatus {
         device: device.to_string(),
+        info: DriveInfo {
+            model: bytes_to_string(&identify.mn),
+            serial_number: bytes_to_string(&identify.sn),
+        },
         temperature_c: temp,
         wear_percentage: smart_log.percent_used,
         spare_percentage: smart_log.avail_spare,
@@ -413,7 +520,7 @@ fn find_nvme_devices() -> Vec<String> {
 fn send_email_alert(config: &EmailConfig, statuses: &[DriveStatus]) -> Result<()> {
     let alerts: Vec<_> = statuses
         .iter()
-        .flat_map(|s| s.alerts.iter().map(move |a| (s.device.as_str(), a)))
+        .flat_map(|s| s.alerts.iter().map(move |a| (s, a)))
         .collect();
 
     if alerts.is_empty() {
@@ -454,11 +561,12 @@ fn send_email_alert(config: &EmailConfig, statuses: &[DriveStatus]) -> Result<()
         hostname::get().unwrap().to_string_lossy()
     );
 
-    for (device, alert) in &alerts {
+    for (status, alert) in &alerts {
         html_body.push_str(&format!(
-            r#"<li class="{}">[{}] {}</li>"#,
+            r#"<li class="{}">[{} - {}] {}</li>"#,
             alert.level.as_css_class(),
-            device,
+            status.device,
+            status.info.model,
             alert.message
         ));
     }
@@ -469,6 +577,8 @@ fn send_email_alert(config: &EmailConfig, statuses: &[DriveStatus]) -> Result<()
 <table>
 <tr>
     <th>Drive</th>
+    <th>Model</th>
+    <th>Serial Number</th>
     <th>Temperature</th>
     <th>Wear</th>
     <th>Spare</th>
@@ -483,6 +593,8 @@ fn send_email_alert(config: &EmailConfig, statuses: &[DriveStatus]) -> Result<()
         html_body.push_str(&format!(
             r#"<tr>
     <td>{}</td>
+    <td>{}</td>
+    <td>{}</td>
     <td>{}°C</td>
     <td>{}%</td>
     <td>{}%</td>
@@ -492,6 +604,8 @@ fn send_email_alert(config: &EmailConfig, statuses: &[DriveStatus]) -> Result<()
     <td>{:.2}</td>
 </tr>"#,
             status.device,
+            status.info.model,
+            status.info.serial_number,
             status.temperature_c,
             status.wear_percentage,
             status.spare_percentage,
@@ -543,12 +657,12 @@ fn check_all_drives(config: &Config) -> Result<Vec<DriveStatus>> {
     let mut statuses = Vec::new();
 
     for device in devices {
-        match get_smart_log(&device) {
-            Ok(smart_log) => {
-                let status = check_drive_health(&device, &smart_log, &config.thresholds);
+        match (get_smart_log(&device), get_identify_controller(&device)) {
+            (Ok(smart_log), Ok(identify)) => {
+                let status = check_drive_health(&device, &smart_log, &identify, &config.thresholds);
                 statuses.push(status);
             }
-            Err(e) => {
+            (Err(e), _) | (_, Err(e)) => {
                 eprintln!("Error checking {device}: {e}");
             }
         }
@@ -560,6 +674,8 @@ fn check_all_drives(config: &Config) -> Result<Vec<DriveStatus>> {
 fn print_status_text(statuses: &[DriveStatus]) {
     for status in statuses {
         println!("\n=== {} ===", status.device);
+        println!("Model: {}", status.info.model);
+        println!("Serial Number: {}", status.info.serial_number);
         println!("Temperature: {}°C", status.temperature_c);
         println!("Wear Level: {}%", status.wear_percentage);
         println!("Available Spare: {}%", status.spare_percentage);
@@ -602,9 +718,10 @@ fn run_daemon(config: Config) -> Result<()> {
                     for status in &statuses {
                         for alert in &status.alerts {
                             println!(
-                                "  [{}] {}: {}",
+                                "  [{}] {} ({}): {}",
                                 alert.level.as_str(),
                                 status.device,
+                                status.info.model,
                                 alert.message
                             );
                         }
@@ -684,6 +801,40 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn create_test_identify() -> NvmeIdentifyController {
+        let mut identify = NvmeIdentifyController {
+            vid: 0,
+            ssvid: 0,
+            sn: [0; 20],
+            mn: [0; 40],
+            fr: [0; 8],
+            rab: 0,
+            ieee: [0; 3],
+            cmic: 0,
+            mdts: 0,
+            cntlid: 0,
+            ver: 0,
+            rtd3r: 0,
+            rtd3e: 0,
+            oaes: 0,
+            ctratt: 0,
+            rrls: 0,
+            rsvd106: [0; 9],
+            cntrltype: 0,
+            fguid: [0; 16],
+            crdt1: 0,
+            crdt2: 0,
+            crdt3: 0,
+            rsvd134: [0; 122],
+        };
+        // Set a test model and serial
+        let model = b"Test Model NVMe";
+        let serial = b"TEST123456";
+        identify.mn[..model.len()].copy_from_slice(model);
+        identify.sn[..serial.len()].copy_from_slice(serial);
+        identify
+    }
+
     #[test]
     fn test_u128_from_bytes() {
         let bytes: [u8; 16] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -696,6 +847,18 @@ mod tests {
 
         let bytes: [u8; 16] = [0; 16];
         assert_eq!(u128_from_bytes(&bytes), 0);
+    }
+
+    #[test]
+    fn test_bytes_to_string() {
+        let bytes = [72, 101, 108, 108, 111, 0, 0, 0]; // "Hello" with null padding
+        assert_eq!(bytes_to_string(&bytes), "Hello");
+
+        let bytes = [32, 84, 101, 115, 116, 32, 0, 0]; // " Test " with null padding
+        assert_eq!(bytes_to_string(&bytes), "Test");
+
+        let bytes = [0; 8]; // All nulls
+        assert_eq!(bytes_to_string(&bytes), "");
     }
 
     #[test]
@@ -775,6 +938,18 @@ temp_warning = 60
     }
 
     #[test]
+    fn test_drive_info_serialization() {
+        let info = DriveInfo {
+            model: "Samsung SSD 970 EVO Plus".to_string(),
+            serial_number: "S4EVNZ0N123456".to_string(),
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("Samsung SSD 970 EVO Plus"));
+        assert!(json.contains("S4EVNZ0N123456"));
+    }
+
+    #[test]
     fn test_check_drive_health_temperature_alerts() {
         let thresholds = Thresholds {
             temp_warning: 55,
@@ -782,21 +957,22 @@ temp_warning = 60
             ..Default::default()
         };
 
+        let identify = create_test_identify();
         let mut smart_log = NvmeSmartLog::default();
         smart_log.temperature = (45u16 + 273).to_le_bytes();
         smart_log.avail_spare = 100;
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert!(status.alerts.is_empty());
         assert_eq!(status.temperature_c, 45);
 
         smart_log.temperature = (60u16 + 273).to_le_bytes();
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].level, AlertLevel::Warning);
         assert!(status.alerts[0].message.contains("High temperature"));
 
         smart_log.temperature = (70u16 + 273).to_le_bytes();
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].level, AlertLevel::Critical);
         assert!(status.alerts[0].message.contains("Critical temperature"));
@@ -810,22 +986,23 @@ temp_warning = 60
             ..Default::default()
         };
 
+        let identify = create_test_identify();
         let mut smart_log = NvmeSmartLog::default();
         smart_log.avail_spare = 100;
 
         smart_log.percent_used = 10;
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert!(status.alerts.is_empty());
         assert_eq!(status.wear_percentage, 10);
 
         smart_log.percent_used = 25;
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].level, AlertLevel::Warning);
         assert!(status.alerts[0].message.contains("High wear level"));
 
         smart_log.percent_used = 60;
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].level, AlertLevel::Critical);
         assert!(status.alerts[0].message.contains("Critical wear level"));
@@ -838,15 +1015,16 @@ temp_warning = 60
             ..Default::default()
         };
 
+        let identify = create_test_identify();
         let mut smart_log = NvmeSmartLog::default();
         smart_log.temperature = 273u16.to_le_bytes();
 
         smart_log.avail_spare = 100;
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert!(status.alerts.is_empty());
 
         smart_log.avail_spare = 40;
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].level, AlertLevel::Warning);
         assert!(status.alerts[0].message.contains("Low spare capacity"));
@@ -859,15 +1037,16 @@ temp_warning = 60
             ..Default::default()
         };
 
+        let identify = create_test_identify();
         let mut smart_log = NvmeSmartLog::default();
         smart_log.avail_spare = 100;
 
         smart_log.num_err_log_entries = 50u128.to_le_bytes();
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert!(status.alerts.is_empty());
 
         smart_log.num_err_log_entries = 150u128.to_le_bytes();
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].level, AlertLevel::Warning);
         assert!(status.alerts[0].message.contains("High error count"));
@@ -876,15 +1055,16 @@ temp_warning = 60
     #[test]
     fn test_check_drive_health_media_errors() {
         let thresholds = Thresholds::default();
+        let identify = create_test_identify();
         let mut smart_log = NvmeSmartLog::default();
         smart_log.avail_spare = 100;
 
         smart_log.media_errors = 0u128.to_le_bytes();
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert!(status.alerts.is_empty());
 
         smart_log.media_errors = 5u128.to_le_bytes();
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert_eq!(status.alerts.len(), 1);
         assert_eq!(status.alerts[0].level, AlertLevel::Critical);
         assert!(status.alerts[0].message.contains("Media errors detected"));
@@ -900,6 +1080,7 @@ temp_warning = 60
             ..Default::default()
         };
 
+        let identify = create_test_identify();
         let mut smart_log = NvmeSmartLog::default();
         smart_log.temperature = (60u16 + 273).to_le_bytes();
         smart_log.percent_used = 25;
@@ -907,7 +1088,7 @@ temp_warning = 60
         smart_log.num_err_log_entries = 150u128.to_le_bytes();
         smart_log.media_errors = 1u128.to_le_bytes();
 
-        let status = check_drive_health("/dev/test", &smart_log, &thresholds);
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
         assert_eq!(status.alerts.len(), 5);
 
         let warning_count = status
@@ -925,13 +1106,26 @@ temp_warning = 60
     }
 
     #[test]
+    fn test_check_drive_health_with_identify() {
+        let thresholds = Thresholds::default();
+        let identify = create_test_identify();
+        let mut smart_log = NvmeSmartLog::default();
+        smart_log.avail_spare = 100;
+
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &thresholds);
+        assert_eq!(status.info.model, "Test Model NVMe");
+        assert_eq!(status.info.serial_number, "TEST123456");
+    }
+
+    #[test]
     fn test_data_unit_conversion() {
+        let identify = create_test_identify();
         let mut smart_log = NvmeSmartLog::default();
         smart_log.avail_spare = 100;
         smart_log.data_units_written = 1953125u128.to_le_bytes();
         smart_log.data_units_read = 3906250u128.to_le_bytes();
 
-        let status = check_drive_health("/dev/test", &smart_log, &Thresholds::default());
+        let status = check_drive_health("/dev/test", &smart_log, &identify, &Thresholds::default());
 
         assert!((status.data_written_tb - 1.0).abs() < 0.01);
         assert!((status.data_read_tb - 2.0).abs() < 0.01);
@@ -979,6 +1173,10 @@ temp_warning = 60
     fn test_drive_status_serialization() {
         let status = DriveStatus {
             device: "/dev/nvme0n1".to_string(),
+            info: DriveInfo {
+                model: "Samsung SSD 970 EVO Plus".to_string(),
+                serial_number: "S4EVNZ0N123456".to_string(),
+            },
             temperature_c: 45,
             wear_percentage: 10,
             spare_percentage: 100,
@@ -995,6 +1193,8 @@ temp_warning = 60
 
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("nvme0n1"));
+        assert!(json.contains("Samsung SSD 970 EVO Plus"));
+        assert!(json.contains("S4EVNZ0N123456"));
         assert!(json.contains("45"));
         assert!(json.contains("Test warning"));
         assert!(json.contains("Warning"));
