@@ -727,10 +727,10 @@ fn run_daemon(config: Config) -> Result<()> {
                         }
                     }
 
-                    if let Some(ref email_config) = config.email {
-                        if let Err(e) = send_email_alert(email_config, &statuses) {
-                            eprintln!("Failed to send email alert: {e}");
-                        }
+                    if let Some(ref email_config) = config.email
+                        && let Err(e) = send_email_alert(email_config, &statuses)
+                    {
+                        eprintln!("Failed to send email alert: {e}");
                     }
                 } else {
                     println!("{}", format_log_message("All drives healthy"));
