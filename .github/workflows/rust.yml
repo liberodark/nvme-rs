@@ -31,8 +31,8 @@ jobs:
           sudo apt-get install -y pkg-config libssl-dev
       - name: Install Rust
         run: |
-          rustup update 1.86.0
-          rustup default 1.86.0
+          rustup update 1.91.1
+          rustup default 1.91.1
           rustup component add rustfmt clippy
       - name: Check formatting
         run: cargo fmt --all -- --check
