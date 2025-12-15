@@ -110,13 +110,13 @@ jobs:
           tar -czvf nvme-rs-${{ env.VERSION }}-linux-x86_64.tar.gz nvme-rs
           cd ../..
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: nvme-rs-linux
           path: target/release/nvme-rs
       - name: Upload tarball artifact
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: nvme-rs-linux-tarball
           path: target/release/nvme-rs-${{ env.VERSION }}-linux-x86_64.tar.gz
