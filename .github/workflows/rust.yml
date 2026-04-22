@@ -163,7 +163,7 @@ jobs:
             echo "CHANGELOG=Release version ${{ env.VERSION }}" >> $GITHUB_ENV
           fi
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             nvme-rs-${{ env.VERSION }}-linux-x86_64
